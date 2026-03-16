@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "": {
+      "model": "weatherclouds:block/snow_cloud"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "block.weatherclouds.rain_cloud": "Rain Cloud",
+  "block.weatherclouds.snow_cloud": "Snow Cloud",
+  "itemGroup.weatherclouds": "Weather Clouds"
+}

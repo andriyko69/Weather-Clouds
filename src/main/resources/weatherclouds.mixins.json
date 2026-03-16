@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "io.github.andriyko69.weatherclouds.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+  ],
+  "client": [
+    "client.LevelRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

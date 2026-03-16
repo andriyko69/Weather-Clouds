@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "building",
+  "key": {
+    "D": {
+      "item": "minecraft:diamond"
+    },
+    "M": {
+      "item": "minecraft:white_wool"
+    },
+    "W": {
+      "item": "minecraft:water_bucket"
+    }
+  },
+  "pattern": [
+    "MMM",
+    "MDM",
+    "MWM"
+  ],
+  "result": {
+    "count": 1,
+    "id": "weatherclouds:rain_cloud"
+  }
+}
