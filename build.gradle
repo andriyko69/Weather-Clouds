@@ -116,6 +116,10 @@ configurations {
     runtimeClasspath.extendsFrom localRuntime
 }
 
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+}
+
 dependencies {
     // Example optional mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
@@ -134,6 +138,12 @@ dependencies {
 
     // Example project dependency using a sister or child project:
     // implementation project(":myproject")
+
+    testImplementation platform('org.junit:junit-bom:5.14.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Plain unit tests do not get Minecraft's runtime libraries; match the fastutil version Minecraft 1.21.1 ships.
+    testRuntimeOnly 'it.unimi.dsi:fastutil:8.5.12'
 
     // For more info:
     // http://www.gradle.org/docs/current/userguide/artifact_dependencies_tutorial.html

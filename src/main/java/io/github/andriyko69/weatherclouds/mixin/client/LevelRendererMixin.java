@@ -9,8 +9,10 @@ import com.mojang.blaze3d.vertex.BufferUploader;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexFormat.Mode;
+import io.github.andriyko69.weatherclouds.client.weather.ClientCloudTracker;
+import io.github.andriyko69.weatherclouds.client.weather.CloudColumn;
+import io.github.andriyko69.weatherclouds.client.weather.PrecipitationGeometry;
 import io.github.andriyko69.weatherclouds.util.WeatherCloudType;
-import io.github.andriyko69.weatherclouds.weather.LocalCloudWeather;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -18,15 +20,14 @@ import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.BlockAndTintGetter;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelReader;
 import net.minecraft.world.level.biome.Biome;
-import net.minecraft.world.level.biome.Biome.Precipitation;
 import net.minecraft.world.level.levelgen.Heightmap.Types;
-import org.jetbrains.annotations.Nullable;
+import net.minecraft.world.level.levelgen.SingleThreadedRandomSource;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -35,16 +36,24 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.Arrays;
+
 @Mixin(LevelRenderer.class)
 public abstract class LevelRendererMixin {
+    @Unique private static final int WC_TICK_RAIN_HORIZONTAL_RADIUS = 16;
+    @Unique private static final int WC_TICK_RAIN_VERTICAL_RADIUS = 32;
+
     @Shadow @Final private Minecraft minecraft;
     @Shadow private ClientLevel level;
     @Shadow private int ticks;
-    @Shadow @Final private float[] rainSizeX;
-    @Shadow @Final private float[] rainSizeZ;
 
-    @Shadow @Final private static net.minecraft.resources.ResourceLocation RAIN_LOCATION;
-    @Shadow @Final private static net.minecraft.resources.ResourceLocation SNOW_LOCATION;
+    @Shadow @Final private static ResourceLocation RAIN_LOCATION;
+    @Shadow @Final private static ResourceLocation SNOW_LOCATION;
+
+    @Unique private final BlockPos.MutableBlockPos wc$lightPos = new BlockPos.MutableBlockPos();
+    // Reseeded per column, yielding the same sequence as vanilla's per-column RandomSource.create(seed).
+    @Unique private final RandomSource wc$columnRandom = new SingleThreadedRandomSource(0L);
+    @Unique private final int[] wc$sheetsPerViewBin = new int[PrecipitationGeometry.ANGULAR_BINS];
 
     @Shadow
     public static int getLightColor(BlockAndTintGetter level, BlockPos pos) {
@@ -52,21 +61,9 @@ public abstract class LevelRendererMixin {
     }
 
     @Unique
-    @Nullable
-    private WeatherCloudType wc$getLocalWeatherAt(LevelReader level, BlockPos pos) {
-        return LocalCloudWeather.getLocalPrecipitationAt(level, pos);
-    }
-
-    @Unique
     private boolean wc$globalWeatherActive() {
         ClientLevel level = this.minecraft.level;
         return level != null && level.getRainLevel(this.minecraft.getTimer().getGameTimeDeltaPartialTick(false)) > 0.0F;
-    }
-
-    @Unique
-    private boolean wc$hasLocalWeatherAround(BlockPos cameraPos) {
-        ClientLevel level = this.minecraft.level;
-        return level != null && LocalCloudWeather.hasLocalPrecipitationAround(level, cameraPos, 16, 32);
     }
 
     @WrapOperation(
@@ -81,26 +78,17 @@ public abstract class LevelRendererMixin {
             Operation<Boolean> original,
             @Local BlockPos.MutableBlockPos blockpos$mutableblockpos
     ) {
-        ClientLevel level = this.minecraft.level;
-        if (level != null) {
-            LocalCloudWeather.LocalPrecipitation local =
-                    LocalCloudWeather.getLocalPrecipitation(
-                            level,
-                            new BlockPos(
-                                    blockpos$mutableblockpos.getX(),
-                                    level.getMaxBuildHeight() - 1,
-                                    blockpos$mutableblockpos.getZ()
-                            )
-                    );
-
-            if (local != null) {
-                return false;
-            }
+        if (ClientCloudTracker.hasPrecipitationColumn(blockpos$mutableblockpos.getX(), blockpos$mutableblockpos.getZ())) {
+            return false;
         }
 
         return original.call(biome);
     }
 
+    /**
+     * Draws one sheet per tracked cloud span within an extended radius, instead of vanilla's fixed grid around
+     * the camera, so distant clouds stay visible without scanning empty columns.
+     */
     @Inject(
             method = "renderSnowAndRain",
             at = @At("RETURN")
@@ -113,7 +101,7 @@ public abstract class LevelRendererMixin {
             double camZ,
             CallbackInfo ci
     ) {
-        if (this.level == null) {
+        if (this.level == null || ClientCloudTracker.columnCount() == 0) {
             return;
         }
 
@@ -121,163 +109,147 @@ public abstract class LevelRendererMixin {
             return;
         }
 
-        BlockPos cameraPos = BlockPos.containing(camX, camY, camZ);
-        if (!this.wc$hasLocalWeatherAround(cameraPos)) {
+        int radius = PrecipitationGeometry.renderRadius(
+                Minecraft.useFancyGraphics(),
+                this.minecraft.options.getEffectiveRenderDistance()
+        );
+        if (!ClientCloudTracker.hasColumnWithin(camX, camZ, radius)) {
             return;
         }
 
         lightTexture.turnOnLightLayer();
-        Level level = this.minecraft.level;
-        int i = Mth.floor(camX);
-        int j = Mth.floor(camY);
-        int k = Mth.floor(camZ);
-        Tesselator tesselator = Tesselator.getInstance();
-        BufferBuilder bufferbuilder = null;
-
         RenderSystem.disableCull();
         RenderSystem.enableBlend();
         RenderSystem.enableDepthTest();
-
-        int l = 5;
-        if (Minecraft.useFancyGraphics()) {
-            l = 10;
-        }
-
         RenderSystem.depthMask(Minecraft.useShaderTransparency());
-        int i1 = -1;
-        float f1 = (float) this.ticks + partialTick;
         RenderSystem.setShader(GameRenderer::getParticleShader);
-        BlockPos.MutableBlockPos blockpos$mutableblockpos = new BlockPos.MutableBlockPos();
 
-        for (int j1 = k - l; j1 <= k + l; ++j1) {
-            for (int k1 = i - l; k1 <= i + l; ++k1) {
-                int l1 = (j1 - k + 16) * 32 + k1 - i + 16;
-                double d0 = (double) this.rainSizeX[l1] * 0.5D;
-                double d1 = (double) this.rainSizeZ[l1] * 0.5D;
+        this.wc$countSheetsPerViewBin(radius, camX, camZ);
 
-                LocalCloudWeather.LocalPrecipitation local =
-                        LocalCloudWeather.getLocalPrecipitation(
-                                level,
-                                new BlockPos(k1, level.getMaxBuildHeight() - 1, j1)
-                        );
-
-                if (local == null) {
-                    continue;
-                }
-
-                int j2 = local.surfacePos().getY() + 1;
-                int k2 = local.cloudPos().getY();
-                int l2 = Mth.clamp(j, j2, k2);
-
-                if (j2 >= k2) {
-                    continue;
-                }
-
-                RandomSource randomsource = RandomSource.create(
-                        (long) k1 * k1 * 3121L + k1 * 45238971L ^ (long) j1 * j1 * 418711L + j1 * 13761L
-                );
-
-                Precipitation precipitation = local.type() == WeatherCloudType.RAIN
-                        ? Precipitation.RAIN
-                        : Precipitation.SNOW;
-
-                blockpos$mutableblockpos.set(k1, j2, j1);
-
-                if (precipitation == Precipitation.RAIN) {
-                    if (i1 != 0) {
-                        if (i1 >= 0) {
-                            BufferUploader.drawWithShader(bufferbuilder.buildOrThrow());
-                        }
-
-                        i1 = 0;
-                        RenderSystem.setShaderTexture(0, RAIN_LOCATION);
-                        bufferbuilder = tesselator.begin(Mode.QUADS, DefaultVertexFormat.PARTICLE);
-                    }
-
-                    int i3 = this.ticks & 131071;
-                    int j3 = k1 * k1 * 3121 + k1 * 45238971 + j1 * j1 * 418711 + j1 * 13761 & 255;
-                    float f2 = 3.0F + randomsource.nextFloat();
-                    float f3 = -((float) (i3 + j3) + partialTick) / 32.0F * f2;
-                    float f4 = f3 % 32.0F;
-                    double d2 = (double) k1 + 0.5D - camX;
-                    double d3 = (double) j1 + 0.5D - camZ;
-                    float f6 = (float) Math.sqrt(d2 * d2 + d3 * d3) / (float) l;
-                    float f7 = ((1.0F - f6 * f6) * 0.5F + 0.5F);
-
-                    blockpos$mutableblockpos.set(k1, l2, j1);
-                    int k3 = getLightColor(level, blockpos$mutableblockpos);
-
-                    bufferbuilder.addVertex((float) ((double) k1 - camX - d0 + 0.5D), (float) ((double) k2 - camY), (float) ((double) j1 - camZ - d1 + 0.5D))
-                            .setUv(0.0F, (float) j2 * 0.25F + f4)
-                            .setColor(1.0F, 1.0F, 1.0F, f7)
-                            .setLight(k3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX + d0 + 0.5D), (float) ((double) k2 - camY), (float) ((double) j1 - camZ + d1 + 0.5D))
-                            .setUv(1.0F, (float) j2 * 0.25F + f4)
-                            .setColor(1.0F, 1.0F, 1.0F, f7)
-                            .setLight(k3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX + d0 + 0.5D), (float) ((double) j2 - camY), (float) ((double) j1 - camZ + d1 + 0.5D))
-                            .setUv(1.0F, (float) k2 * 0.25F + f4)
-                            .setColor(1.0F, 1.0F, 1.0F, f7)
-                            .setLight(k3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX - d0 + 0.5D), (float) ((double) j2 - camY), (float) ((double) j1 - camZ - d1 + 0.5D))
-                            .setUv(0.0F, (float) k2 * 0.25F + f4)
-                            .setColor(1.0F, 1.0F, 1.0F, f7)
-                            .setLight(k3);
-                } else if (precipitation == Precipitation.SNOW) {
-                    if (i1 != 1) {
-                        if (i1 >= 0) {
-                            BufferUploader.drawWithShader(bufferbuilder.buildOrThrow());
-                        }
-
-                        i1 = 1;
-                        RenderSystem.setShaderTexture(0, SNOW_LOCATION);
-                        bufferbuilder = tesselator.begin(Mode.QUADS, DefaultVertexFormat.PARTICLE);
-                    }
-
-                    float f8 = -((float) (this.ticks & 511) + partialTick) / 512.0F;
-                    float f9 = (float) (randomsource.nextDouble() + (double) f1 * 0.01D * (double) ((float) randomsource.nextGaussian()));
-                    float f10 = (float) (randomsource.nextDouble() + (double) (f1 * (float) randomsource.nextGaussian()) * 0.001D);
-                    double d4 = (double) k1 + 0.5D - camX;
-                    double d5 = (double) j1 + 0.5D - camZ;
-                    float f11 = (float) Math.sqrt(d4 * d4 + d5 * d5) / (float) l;
-                    float f5 = ((1.0F - f11 * f11) * 0.3F + 0.5F);
-
-                    blockpos$mutableblockpos.set(k1, l2, j1);
-                    int j4 = getLightColor(level, blockpos$mutableblockpos);
-                    int k4 = j4 >> 16 & 65535;
-                    int l4 = j4 & 65535;
-                    int l3 = (k4 * 3 + 240) / 4;
-                    int i4 = (l4 * 3 + 240) / 4;
-
-                    bufferbuilder.addVertex((float) ((double) k1 - camX - d0 + 0.5D), (float) ((double) k2 - camY), (float) ((double) j1 - camZ - d1 + 0.5D))
-                            .setUv(0.0F + f9, (float) j2 * 0.25F + f8 + f10)
-                            .setColor(1.0F, 1.0F, 1.0F, f5)
-                            .setUv2(i4, l3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX + d0 + 0.5D), (float) ((double) k2 - camY), (float) ((double) j1 - camZ + d1 + 0.5D))
-                            .setUv(1.0F + f9, (float) j2 * 0.25F + f8 + f10)
-                            .setColor(1.0F, 1.0F, 1.0F, f5)
-                            .setUv2(i4, l3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX + d0 + 0.5D), (float) ((double) j2 - camY), (float) ((double) j1 - camZ + d1 + 0.5D))
-                            .setUv(1.0F + f9, (float) k2 * 0.25F + f8 + f10)
-                            .setColor(1.0F, 1.0F, 1.0F, f5)
-                            .setUv2(i4, l3);
-                    bufferbuilder.addVertex((float) ((double) k1 - camX - d0 + 0.5D), (float) ((double) j2 - camY), (float) ((double) j1 - camZ - d1 + 0.5D))
-                            .setUv(0.0F + f9, (float) k2 * 0.25F + f8 + f10)
-                            .setColor(1.0F, 1.0F, 1.0F, f5)
-                            .setUv2(i4, l3);
-                }
-            }
-        }
-
-        if (i1 >= 0) {
-            BufferUploader.drawWithShader(bufferbuilder.buildOrThrow());
-        }
+        // One pass per type keeps texture switches, and therefore draw calls, at two per frame.
+        this.wc$renderLocalPrecipitation(WeatherCloudType.RAIN, radius, partialTick, camX, camY, camZ);
+        this.wc$renderLocalPrecipitation(WeatherCloudType.SNOW, radius, partialTick, camX, camY, camZ);
 
         RenderSystem.enableCull();
         RenderSystem.disableBlend();
         lightTexture.turnOffLightLayer();
     }
 
+    /**
+     * Counts precipitating columns per view direction, rain and snow together since both blend over each other.
+     * Also refreshes the spans of every column in range ahead of the render passes.
+     */
+    @Unique
+    private void wc$countSheetsPerViewBin(int radius, double camX, double camZ) {
+        Arrays.fill(this.wc$sheetsPerViewBin, 0);
+        double radiusSqr = (double) radius * radius;
+
+        for (int columnIndex = 0; columnIndex < ClientCloudTracker.columnCount(); columnIndex++) {
+            CloudColumn column = ClientCloudTracker.column(columnIndex);
+            if (ClientCloudTracker.horizontalDistanceSqr(column, camX, camZ) >= radiusSqr) {
+                continue;
+            }
+
+            ClientCloudTracker.refresh(column);
+            if (column.spanCount() > 0) {
+                this.wc$sheetsPerViewBin[PrecipitationGeometry.angularBin(column.x() + 0.5D - camX, column.z() + 0.5D - camZ)]++;
+            }
+        }
+    }
+
+    @Unique
+    private void wc$renderLocalPrecipitation(
+            WeatherCloudType type,
+            int radius,
+            float partialTick,
+            double camX,
+            double camY,
+            double camZ
+    ) {
+        int cameraX = Mth.floor(camX);
+        int cameraY = Mth.floor(camY);
+        int cameraZ = Mth.floor(camZ);
+        double radiusSqr = (double) radius * radius;
+        float animationTime = (float) this.ticks + partialTick;
+        BufferBuilder bufferbuilder = null;
+
+        for (int columnIndex = 0; columnIndex < ClientCloudTracker.columnCount(); columnIndex++) {
+            CloudColumn column = ClientCloudTracker.column(columnIndex);
+            double distanceSqr = ClientCloudTracker.horizontalDistanceSqr(column, camX, camZ);
+            if (distanceSqr >= radiusSqr) {
+                continue;
+            }
+
+            int x = column.x();
+            int z = column.z();
+            float distance = (float) Math.sqrt(distanceSqr);
+            float halfX = PrecipitationGeometry.sheetHalfX(x - cameraX, z - cameraZ);
+            float halfZ = PrecipitationGeometry.sheetHalfZ(x - cameraX, z - cameraZ);
+            float stackCap = PrecipitationGeometry.stackAlphaCap(
+                    this.wc$sheetsPerViewBin[PrecipitationGeometry.angularBin(x + 0.5D - camX, z + 0.5D - camZ)]
+            );
+            long seed = (long) x * x * 3121L + x * 45238971L ^ (long) z * z * 418711L + z * 13761L;
+
+            for (int spanIndex = 0; spanIndex < column.spanCount(); spanIndex++) {
+                if (column.spanType(spanIndex) != type) {
+                    continue;
+                }
+
+                int bottom = column.spanBottom(spanIndex);
+                int top = column.spanTop(spanIndex);
+                if (bottom >= top) {
+                    continue;
+                }
+
+                if (bufferbuilder == null) {
+                    RenderSystem.setShaderTexture(0, type == WeatherCloudType.RAIN ? RAIN_LOCATION : SNOW_LOCATION);
+                    bufferbuilder = Tesselator.getInstance().begin(Mode.QUADS, DefaultVertexFormat.PARTICLE);
+                }
+
+                this.wc$columnRandom.setSeed(seed);
+                this.wc$lightPos.set(x, Mth.clamp(cameraY, bottom, top), z);
+                int light = getLightColor(this.level, this.wc$lightPos);
+
+                float x0 = (float) (x - camX - halfX + 0.5D);
+                float x1 = (float) (x - camX + halfX + 0.5D);
+                float z0 = (float) (z - camZ - halfZ + 0.5D);
+                float z1 = (float) (z - camZ + halfZ + 0.5D);
+                float yTop = (float) (top - camY);
+                float yBottom = (float) (bottom - camY);
+
+                if (type == WeatherCloudType.RAIN) {
+                    int tickPhase = this.ticks & 131071;
+                    int columnPhase = x * x * 3121 + x * 45238971 + z * z * 418711 + z * 13761 & 255;
+                    float speed = 3.0F + this.wc$columnRandom.nextFloat();
+                    float scroll = (-((float) (tickPhase + columnPhase) + partialTick) / 32.0F * speed) % 32.0F;
+                    float alpha = PrecipitationGeometry.columnAlpha(distance, radius, 0.5F, stackCap);
+
+                    bufferbuilder.addVertex(x0, yTop, z0).setUv(0.0F, bottom * 0.25F + scroll).setColor(1.0F, 1.0F, 1.0F, alpha).setLight(light);
+                    bufferbuilder.addVertex(x1, yTop, z1).setUv(1.0F, bottom * 0.25F + scroll).setColor(1.0F, 1.0F, 1.0F, alpha).setLight(light);
+                    bufferbuilder.addVertex(x1, yBottom, z1).setUv(1.0F, top * 0.25F + scroll).setColor(1.0F, 1.0F, 1.0F, alpha).setLight(light);
+                    bufferbuilder.addVertex(x0, yBottom, z0).setUv(0.0F, top * 0.25F + scroll).setColor(1.0F, 1.0F, 1.0F, alpha).setLight(light);
+                } else {
+                    float scroll = -((float) (this.ticks & 511) + partialTick) / 512.0F;
+                    float driftU = (float) (this.wc$columnRandom.nextDouble() + animationTime * 0.01D * (float) this.wc$columnRandom.nextGaussian());
+                    float driftV = (float) (this.wc$columnRandom.nextDouble() + (animationTime * (float) this.wc$columnRandom.nextGaussian()) * 0.001D);
+                    float alpha = PrecipitationGeometry.columnAlpha(distance, radius, 0.3F, stackCap);
+                    int blockLight = ((light & 65535) * 3 + 240) / 4;
+                    int skyLight = ((light >> 16 & 65535) * 3 + 240) / 4;
+
+                    bufferbuilder.addVertex(x0, yTop, z0).setUv(driftU, bottom * 0.25F + scroll + driftV).setColor(1.0F, 1.0F, 1.0F, alpha).setUv2(blockLight, skyLight);
+                    bufferbuilder.addVertex(x1, yTop, z1).setUv(1.0F + driftU, bottom * 0.25F + scroll + driftV).setColor(1.0F, 1.0F, 1.0F, alpha).setUv2(blockLight, skyLight);
+                    bufferbuilder.addVertex(x1, yBottom, z1).setUv(1.0F + driftU, top * 0.25F + scroll + driftV).setColor(1.0F, 1.0F, 1.0F, alpha).setUv2(blockLight, skyLight);
+                    bufferbuilder.addVertex(x0, yBottom, z0).setUv(driftU, top * 0.25F + scroll + driftV).setColor(1.0F, 1.0F, 1.0F, alpha).setUv2(blockLight, skyLight);
+                }
+            }
+        }
+
+        if (bufferbuilder != null) {
+            BufferUploader.drawWithShader(bufferbuilder.buildOrThrow());
+        }
+    }
+
+    // Splash particles and sounds keep vanilla's ±10 block sampling, so only nearby clouds are audible.
     @WrapOperation(
             method = "tickRain",
             at = @At(
@@ -297,7 +269,9 @@ public abstract class LevelRendererMixin {
         }
 
         BlockPos cameraPos = BlockPos.containing(camera.getPosition());
-        return this.wc$hasLocalWeatherAround(cameraPos) ? 1.0F : 0.0F;
+        return ClientCloudTracker.hasPrecipitationNear(cameraPos, WC_TICK_RAIN_HORIZONTAL_RADIUS, WC_TICK_RAIN_VERTICAL_RADIUS)
+                ? 1.0F
+                : 0.0F;
     }
 
     @WrapOperation(
@@ -312,12 +286,8 @@ public abstract class LevelRendererMixin {
             BlockPos pos,
             Operation<Biome.Precipitation> original
     ) {
-        ClientLevel level = this.minecraft.level;
-        if (level == null) {
-            return original.call(biome, pos);
-        }
-
-        WeatherCloudType local = this.wc$getLocalWeatherAt(level, pos);
+        CloudColumn column = ClientCloudTracker.columnAt(pos.getX(), pos.getZ());
+        WeatherCloudType local = column != null ? column.typeAt(pos.getY()) : null;
         if (local == WeatherCloudType.RAIN) {
             return Biome.Precipitation.RAIN;
         }
@@ -347,20 +317,12 @@ public abstract class LevelRendererMixin {
     ) {
         BlockPos vanilla = original.call(instance, heightmapType, pos);
 
-        if (!(instance instanceof Level level)) {
+        CloudColumn column = ClientCloudTracker.columnAt(pos.getX(), pos.getZ());
+        if (column == null) {
             return vanilla;
         }
 
-        LocalCloudWeather.LocalPrecipitation precipitation =
-                LocalCloudWeather.getLocalPrecipitation(
-                        level,
-                        new BlockPos(pos.getX(), level.getMaxBuildHeight() - 1, pos.getZ())
-                );
-
-        if (precipitation == null) {
-            return vanilla;
-        }
-
-        return precipitation.precipitationPos();
+        int precipitationY = column.nearestSpanBottom(pos.getY());
+        return precipitationY == CloudColumn.NO_SPAN ? vanilla : new BlockPos(pos.getX(), precipitationY, pos.getZ());
     }
 }

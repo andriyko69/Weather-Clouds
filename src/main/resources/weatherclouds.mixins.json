@@ -5,6 +5,7 @@
   "mixins": [
   ],
   "client": [
+    "client.LevelMixin",
     "client.LevelRendererMixin"
   ],
   "injectors": {
