@@ -1,6 +1,7 @@
 package io.github.andriyko69.weatherclouds.block;
 
 import com.mojang.serialization.MapCodec;
+import io.github.andriyko69.weatherclouds.compat.srm.SnowRealMagicCompat;
 import io.github.andriyko69.weatherclouds.util.WeatherCloudType;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -62,7 +63,7 @@ public abstract class WeatherCloudBlock extends Block {
         );
 
         if (this.getCloudType() == WeatherCloudType.SNOW) {
-            tryAccumulateSnow(level, target.precipitationPos());
+            tryAccumulateSnow(level, target);
         }
     }
 
@@ -95,21 +96,25 @@ public abstract class WeatherCloudBlock extends Block {
                 : Biome.Precipitation.SNOW;
     }
 
-    private void tryAccumulateSnow(ServerLevel level, BlockPos precipitationPos) {
+    private void tryAccumulateSnow(ServerLevel level, PrecipitationTarget target) {
+        BlockPos precipitationPos = target.precipitationPos();
         if (precipitationPos.getY() < level.getMinBuildHeight() || precipitationPos.getY() >= level.getMaxBuildHeight()) {
+            return;
+        }
+
+        if (SnowRealMagicCompat.tryAccumulateSnow(level, target.surfacePos(), precipitationPos)) {
+            return;
+        }
+
+        // Snow of 2+ layers has collision, so the surface scan stops on the pile itself rather than above it.
+        if (tryGrowSnowLayer(level, target.surfacePos())) {
             return;
         }
 
         BlockState currentState = level.getBlockState(precipitationPos);
 
         if (currentState.is(Blocks.SNOW)) {
-            int layers = currentState.getValue(SnowLayerBlock.LAYERS);
-            if (layers < 8) {
-                BlockState increased = currentState.setValue(SnowLayerBlock.LAYERS, layers + 1);
-                if (increased.canSurvive(level, precipitationPos)) {
-                    level.setBlockAndUpdate(precipitationPos, increased);
-                }
-            }
+            tryGrowSnowLayer(level, precipitationPos);
             return;
         }
 
@@ -117,6 +122,24 @@ public abstract class WeatherCloudBlock extends Block {
         if (currentState.canBeReplaced() && snowState.canSurvive(level, precipitationPos)) {
             level.setBlockAndUpdate(precipitationPos, snowState);
         }
+    }
+
+    private static boolean tryGrowSnowLayer(ServerLevel level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        if (!state.is(Blocks.SNOW)) {
+            return false;
+        }
+
+        int layers = state.getValue(SnowLayerBlock.LAYERS);
+        if (layers >= 8) {
+            return false;
+        }
+
+        BlockState increased = state.setValue(SnowLayerBlock.LAYERS, layers + 1);
+        if (increased.canSurvive(level, pos)) {
+            level.setBlockAndUpdate(pos, increased);
+        }
+        return true;
     }
 
     @Nullable

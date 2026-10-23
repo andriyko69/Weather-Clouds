@@ -27,6 +27,17 @@ sourceSets.main.resources {
 }
 
 repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'Modrinth'
+                url = 'https://api.modrinth.com/maven'
+            }
+        }
+        filter {
+            includeGroup 'maven.modrinth'
+        }
+    }
 }
 
 base {
@@ -106,6 +117,12 @@ neoForge {
             sourceSet(sourceSets.main)
         }
     }
+
+    // Runs JUnit inside a booted FML environment so tests can load Minecraft classes and query the real ModList.
+    unitTest {
+        enable()
+        testedMod = mods."${mod_id}"
+    }
 }
 
 // Sets up a dependency configuration called 'localRuntime'.
@@ -139,11 +156,13 @@ dependencies {
     // Example project dependency using a sister or child project:
     // implementation project(":myproject")
 
+    // Optional compat: compile against Snow! Real Magic! (and Kiwi, its API's supertypes) but never ship or require it.
+    compileOnly "maven.modrinth:snow-real-magic:${snow_real_magic_version}"
+    compileOnly "maven.modrinth:kiwi:${kiwi_version}"
+
     testImplementation platform('org.junit:junit-bom:5.14.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    // Plain unit tests do not get Minecraft's runtime libraries; match the fastutil version Minecraft 1.21.1 ships.
-    testRuntimeOnly 'it.unimi.dsi:fastutil:8.5.12'
 
     // For more info:
     // http://www.gradle.org/docs/current/userguide/artifact_dependencies_tutorial.html
